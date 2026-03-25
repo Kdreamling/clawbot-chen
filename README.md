@@ -41,6 +41,8 @@
 
 ## 快速开始
 
+> **懒得折腾？** 直接下载打包好的 exe 使用：[Releases](https://github.com/SiverKing/weixin-ClawBot-API/releases)
+
 ### Python 版
 
 **安装依赖：**
