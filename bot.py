@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import json
+import os
 import random
 import re
 import aiohttp
@@ -7,18 +9,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dusapi import DusAPI, DusConfig
 
-# dusapi注册地址：https://dusapi.com
-# 或自行更改为你要接入的接口/AI，想先测试可以直接运行，接口返回失败也会自动回复消息
-# ========== 配置 ==========
-config = DusConfig(
-    api_key="you-api-key",
-    base_url="https://api.dusapi.com",
-    model1="gpt-5",
-    prompt="你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量少一些",
-)
-ai = DusAPI(config)
 executor = ThreadPoolExecutor(max_workers=4)
-# ==========================
+ai = None  # 启动时从配置文件加载后初始化
 
 # ========== 自动重连配置（可调参数） ==========
 # 测试时将数值改小，例如：
@@ -32,6 +24,82 @@ RECONNECT_CONFIG = {
     "qrcode_scan_timeout":       600,  # 等待用户扫码最长时间（秒）
 }
 # =============================================
+
+# ========== 配置文件 ==========
+CONFIG_FILE = "config.json"
+_DEFAULT_PROMPT = "你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量少一些"
+
+
+def mask_key(key: str) -> str:
+    """保留前5位和后5位，中间用星号替换。"""
+    if len(key) <= 10:
+        return key
+    return key[:5] + "*" * (len(key) - 10) + key[-5:]
+
+
+def load_or_create_config() -> dict:
+    """检查配置文件，不存在则引导用户创建，存在则显示并确认。"""
+    sep = "=" * 60
+    dash = "-" * 60
+    while True:
+        if not os.path.exists(CONFIG_FILE):
+            print(f"\n{sep}")
+            print("  首次运行，需要配置 API 信息")
+            print(sep)
+            print()
+            print("  !! 重要提示 !!")
+            print("  当前版本仅支持 DusAPI")
+            print("  注册地址：https://dusapi.com")
+            print("  如需使用其他 AI 接口，请前往 GitHub 拉取源代码自行修改")
+            print(dash)
+
+            api_key = input("\n请输入 API Key（留空使用默认值 your-api-key）: ").strip()
+            if not api_key:
+                api_key = "your-api-key"
+
+            base_url = input("请输入 API 地址（留空默认 https://api.dusapi.com）: ").strip()
+            if not base_url:
+                base_url = "https://api.dusapi.com"
+
+            model = input("请输入模型名称（留空默认 gpt-5）: ").strip()
+            if not model:
+                model = "gpt-5"
+
+            prompt = input(f"请输入系统提示词（留空使用默认值）: ").strip()
+            if not prompt:
+                prompt = _DEFAULT_PROMPT
+
+            cfg = {
+                "api_key": api_key,
+                "base_url": base_url,
+                "model": model,
+                "prompt": prompt,
+            }
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            print(f"\n配置已保存到 {CONFIG_FILE}\n")
+            return cfg
+
+        else:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+
+            print(f"\n{sep}")
+            print("  检测到配置文件，当前配置如下：")
+            print(sep)
+            print(f"  API Key  : {mask_key(cfg.get('api_key', ''))}")
+            print(f"  API 地址 : {cfg.get('base_url', '')}")
+            print(f"  模型     : {cfg.get('model', '')}")
+            prompt_preview = cfg.get("prompt", "")[:50]
+            print(f"  提示词   : {prompt_preview}{'...' if len(cfg.get('prompt','')) > 50 else ''}")
+            print(dash)
+
+            choice = input("\n使用此配置继续？(直接回车或输入 Y 继续 / 输入 N 重新配置): ").strip().upper()
+            if choice == "N":
+                os.remove(CONFIG_FILE)
+                continue  # 回到循环顶部重新创建
+            return cfg
+# ==============================
 
 BASE_URL = "https://ilinkai.weixin.qq.com"
 
@@ -399,4 +467,11 @@ async def main():
                     )
 
 
+_raw_cfg = load_or_create_config()
+ai = DusAPI(DusConfig(
+    api_key=_raw_cfg["api_key"],
+    base_url=_raw_cfg["base_url"],
+    model1=_raw_cfg["model"],
+    prompt=_raw_cfg["prompt"],
+))
 asyncio.run(main())

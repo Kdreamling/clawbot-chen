@@ -1,4 +1,5 @@
 import fs from "fs";
+import readline from "readline";
 
 const BASE_URL = "https://ilinkai.weixin.qq.com";
 
@@ -16,6 +17,71 @@ const RECONNECT_CONFIG = {
   qrcode_scan_timeout:       600,  // 等待用户扫码最长时间（秒）
 };
 // =============================================
+
+// ========== 配置文件 ==========
+const CONFIG_FILE = "config.json";
+const DEFAULT_PROMPT = "你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量少一些";
+
+function maskKey(key) {
+  if (key.length <= 10) return key;
+  return key.slice(0, 5) + "*".repeat(key.length - 10) + key.slice(-5);
+}
+
+function rlQuestion(rl, q) {
+  return new Promise(resolve => rl.question(q, resolve));
+}
+
+async function loadOrCreateConfig() {
+  const sep = "=".repeat(60);
+  const dash = "-".repeat(60);
+  while (true) {
+    if (!fs.existsSync(CONFIG_FILE)) {
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      console.log(`\n${sep}`);
+      console.log("  首次运行，需要配置 API 信息");
+      console.log(sep);
+      console.log();
+      console.log("  !! 重要提示 !!");
+      console.log("  当前版本仅支持 DusAPI");
+      console.log("  注册地址：https://dusapi.com");
+      console.log("  如需使用其他 AI 接口，请前往 GitHub 拉取源代码自行修改");
+      console.log(dash);
+
+      const apiKey = (await rlQuestion(rl, "\n请输入 API Key（留空使用默认值 your-api-key）: ")).trim() || "your-api-key";
+      const baseUrl = (await rlQuestion(rl, "请输入 API 地址（留空默认 https://api.dusapi.com）: ")).trim() || "https://api.dusapi.com";
+      const model = (await rlQuestion(rl, "请输入模型名称（留空默认 gpt-5）: ")).trim() || "gpt-5";
+      const prompt = (await rlQuestion(rl, "请输入系统提示词（留空使用默认值）: ")).trim() || DEFAULT_PROMPT;
+      rl.close();
+
+      const cfg = { api_key: apiKey, base_url: baseUrl, model, prompt };
+      fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), "utf-8");
+      console.log(`\n配置已保存到 ${CONFIG_FILE}\n`);
+      return cfg;
+    } else {
+      const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf-8"));
+      console.log(`\n${sep}`);
+      console.log("  检测到配置文件，当前配置如下：");
+      console.log(sep);
+      console.log(`  API Key  : ${maskKey(cfg.api_key ?? "")}`);
+      console.log(`  API 地址 : ${cfg.base_url ?? ""}`);
+      console.log(`  模型     : ${cfg.model ?? ""}`);
+      const p = cfg.prompt ?? "";
+      console.log(`  提示词   : ${p.slice(0, 50)}${p.length > 50 ? "..." : ""}`);
+      console.log(dash);
+
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const choice = (await rlQuestion(rl, "\n使用此配置继续？(直接回车或输入 Y 继续 / 输入 N 重新配置): ")).trim().toUpperCase();
+      rl.close();
+
+      if (choice === "N") {
+        fs.unlinkSync(CONFIG_FILE);
+        continue;
+      }
+      return cfg;
+    }
+  }
+}
+// ==============================
 
 // 共享状态（模块级）
 let botToken;
@@ -278,6 +344,9 @@ async function messageLoop() {
 }
 
 // ── 启动流程 ──
+
+// 0. 加载配置
+const botConfig = await loadOrCreateConfig();
 
 // 1. 获取二维码
 const { qrcode, qrcode_img_content } = await fetch(
