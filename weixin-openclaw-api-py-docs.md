@@ -137,8 +137,10 @@ data = await res.json(content_type=None)
 
 ```
 .
-├── bot.py       # 主程序：微信 iLink Bot 收发消息
-└── dusapi.py    # AI 接口封装：兼容 Anthropic 格式的通用 API 客户端
+├── bot.py        # 主程序：微信 iLink Bot（Python，推荐）
+├── bot.js        # 主程序：微信 iLink Bot（Node.js）
+├── dusapi.py     # AI 接口封装：兼容 Anthropic 格式的通用 API 客户端
+└── config.json   # 运行时配置文件（首次运行自动生成）
 ```
 
 ### dusapi.py — AI 接口封装
@@ -156,7 +158,7 @@ class DusConfig:
     prompt: str = "你是一个有帮助的AI助手。"
 ```
 
-### bot.py — 主程序完整代码
+### bot.py — 主程序完整代码（v1.0.0 基础版，已迭代，见下方更新说明）
 
 ```python
 import asyncio
@@ -407,10 +409,11 @@ pip install aiohttp requests
 python bot.py
 ```
 
-运行后：
-1. 终端打印二维码 URL，手机打开扫描
-2. 扫码成功后显示"登录成功"
-3. 给 Bot 发消息，Bot 会显示"正在输入"然后回复 AI 生成的内容
+运行后（v1.1.0+）：
+1. 首次运行进入交互式配置向导，填写 API Key 等信息保存到 `config.json`
+2. 再次运行显示当前配置（Key 脱敏），确认或重新配置
+3. 终端打印二维码 URL 及可用指令列表，手机扫码连接
+4. 给 Bot 发第一条消息，自动收到指令列表；后续消息走 AI 回复
 
 ---
 
@@ -420,12 +423,86 @@ python bot.py
 
 2. **`context_token` 必须用当前消息的**，不能复用历史 token，否则后续消息无法送达。
 
-3. **`getconfig` 的 `typing_ticket` 可以缓存**，SDK 缓存 24h，同一用户无需每条消息都重新获取。
+3. **`getconfig` 的 `typing_ticket` 可以缓存**，SDK 缓存 24h，同一用户无需每条消息都重新获取。重连后会清空缓存，下一条消息自动重新获取。
 
 4. **腾讯保留对 API 的控制权**，包括限速、内容过滤、随时终止服务，不建议将核心业务完全依赖这套 API。
 
 5. **媒体消息**（图片/视频/文件）需要先 AES-128-ECB 加密上传到 CDN，再在 `item_list` 中引用 CDN 参数，本文未实现，仅支持文本。
 
+6. **`config.json` 含有 API Key**，请勿提交到版本控制。
+
 ---
 
-*基于 `@tencent-weixin/openclaw-weixin@1.0.2` 逆向分析 + Python 实测，截止 2026 年 3 月。*
+## 八、版本更新记录
+
+### v1.1.0（2026-03）
+
+在 v1.0.0 基础协议实现之上，新增以下功能：
+
+#### 配置文件管理
+
+API Key 等配置从代码中抽离，保存为独立的 `config.json`：
+
+- 首次运行交互式引导创建，所有字段均有默认值
+- 再次运行显示当前配置，API Key 仅显示首尾各 5 位，中间以星号替换
+- 选择 N 可删除旧配置并重新填写
+
+```json
+{
+  "api_key": "your-api-key",
+  "base_url": "https://api.dusapi.com",
+  "model": "gpt-5",
+  "prompt": "你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量少一些"
+}
+```
+
+#### 24 小时自动重连
+
+iLink 连接有效期 24 小时，到期须重新扫码。新增 `reconnect_timer_task` 异步任务与主消息循环并发运行：
+
+```
+登录 → 开始倒计时
+  ↓（session_duration - warning_before 秒后）
+向最近联系用户发出预警（Y 立即重连 / N 稍后提醒）
+  ├─ Y → 申请新二维码发给用户，轮询扫码状态
+  │       扫码成功 → bot_token_ref[0] 原子替换，旧连接无缝切换
+  ├─ N → 等待 reminder_interval 秒后再次询问
+  └─ 剩余时间 ≤ force_before → 强制重连，无需确认
+```
+
+所有时间参数集中在顶部 `RECONNECT_CONFIG` 字典，方便测试时调小：
+
+```python
+RECONNECT_CONFIG = {
+    "session_duration":    24 * 3600,  # 生产值；测试时改为 300
+    "warning_before":       2 * 3600,  # 生产值；测试时改为 60
+    "reminder_interval":      30 * 60, # 生产值；测试时改为 30
+    "force_before":           30 * 60, # 生产值；测试时改为 60
+    "qrcode_scan_timeout":       600,  # 生产值；测试时改为 120
+}
+```
+
+**关键实现细节：**
+- `bot_token` 用列表包装为 `bot_token_ref = [bot_token]`，支持跨协程原子替换
+- `bot_base_url_ref` 同样包装，重连后 baseurl 一并更新
+- 重连期间旧 token 继续服务消息循环，扫码成功后下一次 `getupdates` 自动用新 token
+- `do_reconnect()` 有重入守卫（`reconnect_in_progress`），防止强制触发与用户 Y 双重启动
+- 扫码超时后重置 `login_time_ref`，避免立即再次触发警告
+
+#### Bot 指令系统
+
+消息处理优先级（高→低）：
+
+1. **重连确认**：`warning_active` 为真时，`Y`/`N` 触发重连流程，不走 AI
+2. **首次交互**：用户在本次会话首条消息，自动回复指令列表，不走 AI
+3. **指令处理**：`/time` 返回剩余连接时间，不走 AI
+4. **AI 回复**：其余所有消息正常转发给 AI 接口
+
+`/time` 响应示例：
+```
+当前连接剩余时间：21 小时 43 分钟
+```
+
+---
+
+*基于 `@tencent-weixin/openclaw-weixin@1.0.2` 逆向分析 + Python/Node.js 实测，截止 2026 年 3 月。*
