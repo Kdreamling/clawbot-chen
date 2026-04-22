@@ -441,67 +441,78 @@ async def main():
         login_time_ref = [time.time()]
         manual_reconnect_pending = {}  # {from_id: True} 等待用户确认手动重连
 
-        # debounce 合并：Dream 连发多条时，等 DEBOUNCE_SEC 内无新消息再调 AI
-        pending_buffers = {}  # from_id -> {"texts","task","last_ts","context_token","typing_ticket"}
+        # debounce 合并 + 打断重合并：Dream 连发多条 → 合并；模型生成期间再来新消息 → cancel 重合并
+        # phase: idle / debouncing / generating / sending
+        pending_buffers = {}  # from_id -> {"pending","generating","phase","task","last_ts","context_token","typing_ticket"}
         DEBOUNCE_SEC = 1.2
 
         async def _debounce_and_reply(from_id):
             pb = pending_buffers[from_id]
-            # 等到最后一条消息距今 DEBOUNCE_SEC 秒（期间新消息会刷新 last_ts）
-            while True:
-                remaining = DEBOUNCE_SEC - (time.time() - pb["last_ts"])
-                if remaining <= 0:
-                    break
-                await asyncio.sleep(remaining)
-            # 取走 buffer 原子交接（单线程 asyncio，这两行之间无 await 不会被抢占）
-            texts = pb["texts"]
-            pb["texts"] = []
-            ctx = pb["context_token"]
-            tt = pb["typing_ticket"]
-            merged = "\n".join(texts)
-            # 调 AI（阻塞 requests 扔线程池）
-            loop = asyncio.get_event_loop()
-            reply = await loop.run_in_executor(executor, ai.chat, merged)
-            # 按空行分段，逐条发（带 0.8-1.6s 自然停顿）
-            segments = [s.strip() for s in reply.split("\n\n") if s.strip()]
-            if not segments:
-                segments = [reply]
-            for _idx, _seg in enumerate(segments):
-                if _idx > 0:
-                    await asyncio.sleep(random.uniform(0.8, 1.6))
-                client_id = f"openclaw-weixin-{random.randint(0, 0xFFFFFFFF):08x}"
-                send_result = await api_post(
-                    session,
-                    "ilink/bot/sendmessage",
-                    {
-                        "msg": {
-                            "from_user_id": "",
-                            "to_user_id": from_id,
-                            "client_id": client_id,
-                            "message_type": 2,
-                            "message_state": 2,
-                            "context_token": ctx,
-                            "item_list": [{"type": 1, "text_item": {"text": _seg}}],
+            try:
+                pb["phase"] = "debouncing"
+                while True:
+                    remaining = DEBOUNCE_SEC - (time.time() - pb["last_ts"])
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(remaining)
+                pb["generating"] = list(pb["pending"])
+                pb["pending"] = []
+                ctx = pb["context_token"]
+                tt = pb["typing_ticket"]
+                merged = "\n".join(pb["generating"])
+                # 调 AI（aiohttp，asyncio.CancelledError 会干净中断上游流）
+                pb["phase"] = "generating"
+                reply = await ai.chat_async(merged)
+                # sending 阶段开始后不允许打断（已经准备发出微信消息，打断会留半条）
+                pb["phase"] = "sending"
+                segments = [s.strip() for s in reply.split("\n\n") if s.strip()]
+                if not segments:
+                    segments = [reply]
+                for _idx, _seg in enumerate(segments):
+                    if _idx > 0:
+                        await asyncio.sleep(random.uniform(0.8, 1.6))
+                    client_id = f"openclaw-weixin-{random.randint(0, 0xFFFFFFFF):08x}"
+                    send_result = await api_post(
+                        session,
+                        "ilink/bot/sendmessage",
+                        {
+                            "msg": {
+                                "from_user_id": "",
+                                "to_user_id": from_id,
+                                "client_id": client_id,
+                                "message_type": 2,
+                                "message_state": 2,
+                                "context_token": ctx,
+                                "item_list": [{"type": 1, "text_item": {"text": _seg}}],
+                            },
+                            "base_info": {"channel_version": "1.0.2"},
                         },
-                        "base_info": {"channel_version": "1.0.2"},
-                    },
-                    bot_token_ref[0],
-                    bot_base_url_ref[0] or None,
-                )
-                print(f"sendmessage[{_idx+1}/{len(segments)}] 返回: {send_result}")
-            print(f"已回复（合并{len(texts)}条→{len(segments)}段）: {reply[:50]}...")
-            # stop typing
-            if tt:
-                await api_post(
-                    session,
-                    "ilink/bot/sendtyping",
-                    {"ilink_user_id": from_id, "typing_ticket": tt, "status": 2},
-                    bot_token_ref[0],
-                    bot_base_url_ref[0] or None,
-                )
-            # 生成期间到达的消息立刻排下一轮（否则它们会卡在 buffer 里等下条触发）
-            if pb["texts"]:
-                pb["task"] = asyncio.create_task(_debounce_and_reply(from_id))
+                        bot_token_ref[0],
+                        bot_base_url_ref[0] or None,
+                    )
+                    print(f"sendmessage[{_idx+1}/{len(segments)}] 返回: {send_result}")
+                print(f"已回复（合并{len(pb['generating'])}条→{len(segments)}段）: {reply[:50]}...")
+                pb["generating"] = []
+                if tt:
+                    await api_post(
+                        session,
+                        "ilink/bot/sendtyping",
+                        {"ilink_user_id": from_id, "typing_ticket": tt, "status": 2},
+                        bot_token_ref[0],
+                        bot_base_url_ref[0] or None,
+                    )
+                pb["phase"] = "idle"
+                # sending 期间累积的新消息立刻排下一轮
+                if pb["pending"]:
+                    pb["task"] = asyncio.create_task(_debounce_and_reply(from_id))
+            except asyncio.CancelledError:
+                # 被打断：generating 里的消息放回 pending 开头，让新 task 重新合并处理
+                if pb["generating"]:
+                    pb["pending"] = pb["generating"] + pb["pending"]
+                    pb["generating"] = []
+                pb["phase"] = "idle"
+                print(f"[interrupt] debounce task 被打断，generating 归还 pending")
+                raise
 
         # 4. 启动定时器任务（与消息循环并发）
         asyncio.create_task(reconnect_timer_task(
@@ -569,12 +580,9 @@ async def main():
                                             bot_token_ref, bot_base_url_ref)
                     continue
 
-                # 优先级 3：首次交互，发送指令列表
-                if from_id not in welcomed_users:
-                    welcomed_users.add(from_id)
-                    await send_msg_safe(session, from_id, context_token,
-                                        COMMANDS_MSG, bot_token_ref, bot_base_url_ref)
-                    continue
+                # 首次交互不再自动发 COMMANDS_MSG（Dream 和晨私聊不需要教程）
+                # 如想查看指令列表用 /help 或 /指令
+                welcomed_users.add(from_id)
 
                 # /help  /指令 — 返回指令列表
                 if text.strip() in ("/help", "/指令"):
@@ -631,14 +639,27 @@ async def main():
                 # 塞入 debounce buffer：连发消息会合并成一条给 AI，避免上下文错位
                 # typing status=1 已发（上面），stop typing 由 _debounce_and_reply 末尾统一做
                 pb = pending_buffers.setdefault(from_id, {
-                    "texts": [], "task": None, "last_ts": 0.0,
+                    "pending": [], "generating": [], "phase": "idle",
+                    "task": None, "last_ts": 0.0,
                     "context_token": "", "typing_ticket": "",
                 })
-                pb["texts"].append(text)
-                pb["context_token"] = context_token  # 用最新一条的 token（更保险）
+                pb["pending"].append(text)
+                pb["context_token"] = context_token
                 pb["typing_ticket"] = typing_ticket
                 pb["last_ts"] = time.time()
-                if pb["task"] is None or pb["task"].done():
+                if pb["task"] is not None and not pb["task"].done():
+                    if pb["phase"] == "generating":
+                        # 打断：cancel 当前生成，启动新 task 合并重发
+                        print(f"[interrupt] 新消息到达，打断当前生成并合并重来")
+                        pb["task"].cancel()
+                        try:
+                            await pb["task"]
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        pb["task"] = asyncio.create_task(_debounce_and_reply(from_id))
+                    # debouncing: task 的 while 循环会看到 last_ts 更新，自动延后
+                    # sending: 正在发送微信消息，不打断；task 末尾会启动下一轮消费 pending
+                else:
                     pb["task"] = asyncio.create_task(_debounce_and_reply(from_id))
 
 

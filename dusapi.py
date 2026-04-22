@@ -6,10 +6,12 @@
 - 智能模型选择：定期调 /admin/channels，按 preferences 挑第一个 enabled channel 的 model
 - 保留原 DusConfig/DusAPI 类名，bot.py 无需大改
 """
+import asyncio
 import json
 import re
 import time
 import uuid
+import aiohttp
 import requests
 from dataclasses import dataclass, field
 from typing import List, Tuple
@@ -48,6 +50,7 @@ class DusAPI:
         self.config = config
         self.DS_NOW_MOD = config.model1
         self.base_url = config.base_url.rstrip('/')
+        self._aio_session = None  # 懒加载的 aiohttp session（chat_async 用）
         sid = config.session_id
         try:
             uuid.UUID(sid)
@@ -171,6 +174,88 @@ class DusAPI:
                 delay = retry_delays[attempt]
                 log(f"Gateway 第 {attempt+1} 次失败（{type(last_error).__name__}: {last_error}），{delay}s 后重试", "WARN")
                 time.sleep(delay)
+            else:
+                log(f"Gateway 已重试 {max_retries} 次最终失败：{last_error}", "ERROR")
+
+        return "网络抖了一下，晨暂时没收到。过几分钟再试试。"
+
+    # ===== async 版（aiohttp，支持 asyncio.CancelledError 干净中断）=====
+    async def _get_aio_session(self):
+        if self._aio_session is None or self._aio_session.closed:
+            self._aio_session = aiohttp.ClientSession()
+        return self._aio_session
+
+    async def _stream_chat_async(self, model, message):
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": message}],
+            "stream": True,
+        }
+        url = f"{self.base_url}/v1/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "X-Session-Id": self._session_uuid,
+            "X-Client-Hint": "wechat",
+            "Authorization": f"Bearer {self._token}",
+        }
+        text_parts = []
+        s = await self._get_aio_session()
+        timeout = aiohttp.ClientTimeout(total=None, sock_read=180)
+        async with s.post(url, headers=headers, json=payload, timeout=timeout) as r:
+            if r.status == 401:
+                raise RuntimeError("token invalid")
+            r.raise_for_status()
+            buf = b""
+            async for chunk in r.content.iter_any():
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    raw = line.rstrip(b"\r").decode("utf-8", errors="replace")
+                    if not raw or not raw.startswith("data: "):
+                        continue
+                    data_str = raw[6:]
+                    if data_str == "[DONE]":
+                        return "".join(text_parts).strip()
+                    try:
+                        ev = json.loads(data_str)
+                    except Exception:
+                        continue
+                    et = ev.get("type")
+                    if et == "text_delta":
+                        text_parts.append(ev.get("content", ""))
+                    elif et == "error":
+                        raise RuntimeError(f"Gateway 错误: {ev.get('message', 'unknown')}")
+        return "".join(text_parts).strip()
+
+    async def chat_async(self, message, model=None):
+        self._pick_model_if_needed()
+        model = model or self.DS_NOW_MOD
+        retry_delays = [2, 4, 8, 16, 32]
+        max_retries = 5
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                self._ensure_token()
+                text = await self._stream_chat_async(model, message)
+                if not text:
+                    text = "（晨没说话）"
+                if attempt > 0:
+                    log(f"Gateway 第 {attempt} 次重试成功：{text[:80]}...")
+                else:
+                    log(f"Gateway 返回（model={model}）：{text[:80]}...")
+                return text
+            except asyncio.CancelledError:
+                raise  # 不吞 cancel，让打断机制干净传播
+            except RuntimeError as e:
+                if "token invalid" in str(e):
+                    self._token = None
+                last_error = e
+            except Exception as e:
+                last_error = e
+            if attempt < max_retries:
+                delay = retry_delays[attempt]
+                log(f"Gateway 第 {attempt+1} 次失败（{type(last_error).__name__}: {last_error}），{delay}s 后重试", "WARN")
+                await asyncio.sleep(delay)
             else:
                 log(f"Gateway 已重试 {max_retries} 次最终失败：{last_error}", "ERROR")
 
