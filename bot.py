@@ -441,6 +441,68 @@ async def main():
         login_time_ref = [time.time()]
         manual_reconnect_pending = {}  # {from_id: True} 等待用户确认手动重连
 
+        # debounce 合并：Dream 连发多条时，等 DEBOUNCE_SEC 内无新消息再调 AI
+        pending_buffers = {}  # from_id -> {"texts","task","last_ts","context_token","typing_ticket"}
+        DEBOUNCE_SEC = 1.2
+
+        async def _debounce_and_reply(from_id):
+            pb = pending_buffers[from_id]
+            # 等到最后一条消息距今 DEBOUNCE_SEC 秒（期间新消息会刷新 last_ts）
+            while True:
+                remaining = DEBOUNCE_SEC - (time.time() - pb["last_ts"])
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(remaining)
+            # 取走 buffer 原子交接（单线程 asyncio，这两行之间无 await 不会被抢占）
+            texts = pb["texts"]
+            pb["texts"] = []
+            ctx = pb["context_token"]
+            tt = pb["typing_ticket"]
+            merged = "\n".join(texts)
+            # 调 AI（阻塞 requests 扔线程池）
+            loop = asyncio.get_event_loop()
+            reply = await loop.run_in_executor(executor, ai.chat, merged)
+            # 按空行分段，逐条发（带 0.8-1.6s 自然停顿）
+            segments = [s.strip() for s in reply.split("\n\n") if s.strip()]
+            if not segments:
+                segments = [reply]
+            for _idx, _seg in enumerate(segments):
+                if _idx > 0:
+                    await asyncio.sleep(random.uniform(0.8, 1.6))
+                client_id = f"openclaw-weixin-{random.randint(0, 0xFFFFFFFF):08x}"
+                send_result = await api_post(
+                    session,
+                    "ilink/bot/sendmessage",
+                    {
+                        "msg": {
+                            "from_user_id": "",
+                            "to_user_id": from_id,
+                            "client_id": client_id,
+                            "message_type": 2,
+                            "message_state": 2,
+                            "context_token": ctx,
+                            "item_list": [{"type": 1, "text_item": {"text": _seg}}],
+                        },
+                        "base_info": {"channel_version": "1.0.2"},
+                    },
+                    bot_token_ref[0],
+                    bot_base_url_ref[0] or None,
+                )
+                print(f"sendmessage[{_idx+1}/{len(segments)}] 返回: {send_result}")
+            print(f"已回复（合并{len(texts)}条→{len(segments)}段）: {reply[:50]}...")
+            # stop typing
+            if tt:
+                await api_post(
+                    session,
+                    "ilink/bot/sendtyping",
+                    {"ilink_user_id": from_id, "typing_ticket": tt, "status": 2},
+                    bot_token_ref[0],
+                    bot_base_url_ref[0] or None,
+                )
+            # 生成期间到达的消息立刻排下一轮（否则它们会卡在 buffer 里等下条触发）
+            if pb["texts"]:
+                pb["task"] = asyncio.create_task(_debounce_and_reply(from_id))
+
         # 4. 启动定时器任务（与消息循环并发）
         asyncio.create_task(reconnect_timer_task(
             session, bot_token_ref, bot_base_url_ref, last_contact,
@@ -566,51 +628,18 @@ async def main():
                         bot_base_url_ref[0] or None,
                     )
 
-                # 调用 AI
-                loop = asyncio.get_event_loop()
-                # 或者替换为你自已要用的接口
-                reply = await loop.run_in_executor(executor, ai.chat, text)
-
-                # 按空行切成多段，模拟微信一句句发的节奏
-                segments = [s.strip() for s in reply.split("\n\n") if s.strip()]
-                if not segments:
-                    segments = [reply]
-
-                for _idx, _seg in enumerate(segments):
-                    if _idx > 0:
-                        # 每条之间加 0.8-1.6s 随机停顿，像真人在打字
-                        await asyncio.sleep(random.uniform(0.8, 1.6))
-                    client_id = f"openclaw-weixin-{random.randint(0, 0xFFFFFFFF):08x}"
-                    send_result = await api_post(
-                        session,
-                        "ilink/bot/sendmessage",
-                        {
-                            "msg": {
-                                "from_user_id": "",
-                                "to_user_id": from_id,
-                                "client_id": client_id,
-                                "message_type": 2,
-                                "message_state": 2,
-                                "context_token": context_token,
-                                "item_list": [{"type": 1, "text_item": {"text": _seg}}],
-                            },
-                            "base_info": {"channel_version": "1.0.2"},
-                        },
-                        bot_token_ref[0],
-                        bot_base_url_ref[0] or None,
-                    )
-                    print(f"sendmessage[{_idx+1}/{len(segments)}] 返回: {send_result}")
-                print(f"已回复: {reply[:50]}... (分{len(segments)}段)")
-
-                # sendtyping status=2 取消"正在输入"
-                if typing_ticket:
-                    await api_post(
-                        session,
-                        "ilink/bot/sendtyping",
-                        {"ilink_user_id": from_id, "typing_ticket": typing_ticket, "status": 2},
-                        bot_token_ref[0],
-                        bot_base_url_ref[0] or None,
-                    )
+                # 塞入 debounce buffer：连发消息会合并成一条给 AI，避免上下文错位
+                # typing status=1 已发（上面），stop typing 由 _debounce_and_reply 末尾统一做
+                pb = pending_buffers.setdefault(from_id, {
+                    "texts": [], "task": None, "last_ts": 0.0,
+                    "context_token": "", "typing_ticket": "",
+                })
+                pb["texts"].append(text)
+                pb["context_token"] = context_token  # 用最新一条的 token（更保险）
+                pb["typing_ticket"] = typing_ticket
+                pb["last_ts"] = time.time()
+                if pb["task"] is None or pb["task"].done():
+                    pb["task"] = asyncio.create_task(_debounce_and_reply(from_id))
 
 
 print(
