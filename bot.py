@@ -1,3 +1,4 @@
+import sys
 import asyncio
 import base64
 import json
@@ -99,7 +100,7 @@ def load_or_create_config() -> dict:
             print(f"  提示词   : {prompt_preview}{'...' if len(cfg.get('prompt','')) > 50 else ''}")
             print(dash)
 
-            choice = input("\n使用此配置继续？(直接回车或输入 Y 继续 / 输入 N 重新配置): ").strip().upper()
+            choice = (input("\n使用此配置继续？(直接回车或输入 Y 继续 / 输入 N 重新配置): ").strip().upper() if sys.stdin.isatty() else "Y")
             if choice == "N":
                 os.remove(CONFIG_FILE)
                 continue  # 回到循环顶部重新创建
