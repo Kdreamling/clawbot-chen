@@ -116,6 +116,7 @@ class DusAPI:
             "Content-Type": "application/json",
             "X-Session-Id": self._session_uuid,
             "Authorization": f"Bearer {self._token}",
+            "X-Client-Hint": "wechat",
         }
         text_parts = []
         with requests.post(url, headers=headers, json=payload, stream=True, timeout=180) as r:

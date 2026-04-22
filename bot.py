@@ -571,28 +571,36 @@ async def main():
                 # 或者替换为你自已要用的接口
                 reply = await loop.run_in_executor(executor, ai.chat, text)
 
-                # sendmessage（补全 SDK 所需字段）
-                client_id = f"openclaw-weixin-{random.randint(0, 0xFFFFFFFF):08x}"
-                send_result = await api_post(
-                    session,
-                    "ilink/bot/sendmessage",
-                    {
-                        "msg": {
-                            "from_user_id": "",
-                            "to_user_id": from_id,
-                            "client_id": client_id,
-                            "message_type": 2,
-                            "message_state": 2,
-                            "context_token": context_token,
-                            "item_list": [{"type": 1, "text_item": {"text": reply}}],
+                # 按空行切成多段，模拟微信一句句发的节奏
+                segments = [s.strip() for s in reply.split("\n\n") if s.strip()]
+                if not segments:
+                    segments = [reply]
+
+                for _idx, _seg in enumerate(segments):
+                    if _idx > 0:
+                        # 每条之间加 0.8-1.6s 随机停顿，像真人在打字
+                        await asyncio.sleep(random.uniform(0.8, 1.6))
+                    client_id = f"openclaw-weixin-{random.randint(0, 0xFFFFFFFF):08x}"
+                    send_result = await api_post(
+                        session,
+                        "ilink/bot/sendmessage",
+                        {
+                            "msg": {
+                                "from_user_id": "",
+                                "to_user_id": from_id,
+                                "client_id": client_id,
+                                "message_type": 2,
+                                "message_state": 2,
+                                "context_token": context_token,
+                                "item_list": [{"type": 1, "text_item": {"text": _seg}}],
+                            },
+                            "base_info": {"channel_version": "1.0.2"},
                         },
-                        "base_info": {"channel_version": "1.0.2"},
-                    },
-                    bot_token_ref[0],
-                    bot_base_url_ref[0] or None,
-                )
-                print(f"sendmessage 返回: {send_result}")
-                print(f"已回复: {reply[:50]}...")
+                        bot_token_ref[0],
+                        bot_base_url_ref[0] or None,
+                    )
+                    print(f"sendmessage[{_idx+1}/{len(segments)}] 返回: {send_result}")
+                print(f"已回复: {reply[:50]}... (分{len(segments)}段)")
 
                 # sendtyping status=2 取消"正在输入"
                 if typing_ticket:
