@@ -1,0 +1,13 @@
+{
+  "api_key": "not-needed-for-gateway",
+  "base_url": "http://localhost:8001",
+  "model": "your-default-model",
+  "prompt": "",
+  "session_id": "your-session-name",
+  "allow_from": [],
+  "auth_password": "YOUR_GATEWAY_PASSWORD",
+  "model_preferences": [
+    ["primary-model", "primary-channel"],
+    ["fallback-model", "fallback-channel"]
+  ]
+}

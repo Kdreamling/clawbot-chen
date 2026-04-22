@@ -1,0 +1,11 @@
+# 敏感配置
+config.json
+token.json
+
+# 运行时产物
+*.log
+__pycache__/
+*.pyc
+
+# 原文件备份
+*.orig

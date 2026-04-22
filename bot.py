@@ -84,6 +84,11 @@ def load_or_create_config() -> dict:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
 
+            # 非交互模式：存在配置直接返回，不问
+            if os.environ.get("CLAWBOT_AUTO") == "1":
+                print(f"[config] 非交互模式，使用 {CONFIG_FILE}")
+                return cfg
+
             print(f"\n{sep}")
             print("  检测到配置文件，当前配置如下：")
             print(sep)
@@ -306,58 +311,122 @@ async def reconnect_timer_task(session, bot_token_ref, bot_base_url_ref, last_co
                                     remind_msg, bot_token_ref, bot_base_url_ref)
 
 
+TOKEN_FILE = "token.json"
+
+
+def _load_saved_token():
+    """尝试加载上次保存的 bot_token + baseurl。失败返回 (None, '')。"""
+    if not os.path.exists(TOKEN_FILE):
+        return None, ""
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d.get("token"), d.get("baseurl", "")
+    except Exception as e:
+        print(f"[token] 读 {TOKEN_FILE} 失败: {e}")
+        return None, ""
+
+
+def _save_token(token: str, baseurl: str):
+    try:
+        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+            json.dump({"token": token, "baseurl": baseurl, "saved_at": int(time.time())}, f)
+        print(f"[token] 已保存到 {TOKEN_FILE}")
+    except Exception as e:
+        print(f"[token] 保存失败: {e}")
+
+
+async def _verify_token(session, token: str, baseurl: str) -> bool:
+    """验证 token 是否有效。
+    getupdates 是长轮询（hold 最多 35s），短超时不代表 token 失效——
+    反而说明服务器接受了 token 在 hold 连接。只有明确 401 才算无效。
+    """
+    url = f"{(baseurl or BASE_URL).rstrip('/')}/ilink/bot/getupdates"
+    try:
+        async with session.post(
+            url,
+            json={"get_updates_buf": "", "sync_buf": ""},
+            headers=make_headers(token),
+            timeout=aiohttp.ClientTimeout(total=4),
+        ) as res:
+            if res.status == 401:
+                return False
+            return True  # 200 或其他非 401 都算有效
+    except asyncio.TimeoutError:
+        # 长轮询超时 == 服务器在 hold 连接 == token 被接受
+        return True
+    except Exception as e:
+        print(f"[token] 验证异常（非 401）: {type(e).__name__}: {e}")
+        # 网络异常无法判断，宽容当作有效——真失效了消息循环会被 401 拒绝
+        return True
+
+
 async def main():
     async with aiohttp.ClientSession() as session:
-        # 1. 获取二维码
-        async with session.get(
-            f"{BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3"
-        ) as res:
-            data = await res.json(content_type=None)
-
-        qrcode = data["qrcode"]
-        qrcode_img_content = data.get("qrcode_img_content", "")
-
-        print("qrcode:", qrcode)
-        print("qrcode_img_content 前100字符:", str(qrcode_img_content)[:100])
-
-        if qrcode_img_content:
-            content = str(qrcode_img_content)
-            if content.startswith("data:image/"):
-                header, b64 = content.split(",", 1)
-                m = re.search(r"data:image/(\w+)", header)
-                ext = m.group(1) if m else "png"
-                with open(f"qrcode.{ext}", "wb") as f:
-                    f.write(base64.b64decode(b64))
-                print(f"二维码已保存到 qrcode.{ext}")
-            elif content.startswith("http"):
-                print("二维码图片地址:", content)
-                print("请将图片地址复制后在微信里发给文件传输助手，然后在手机端微信打开链接即可连接！！")
-            elif content.startswith("<svg"):
-                with open("qrcode.svg", "w", encoding="utf-8") as f:
-                    f.write(content)
-                print("二维码已保存到 qrcode.svg，用浏览器打开")
-            else:
-                with open("qrcode.png", "wb") as f:
-                    f.write(base64.b64decode(content))
-                print("二维码已保存到 qrcode.png")
-
-        # 2. 等待扫码
-        print("等待扫码...")
+        # 0. 尝试用持久化的 token 跳过扫码
         bot_token = None
         bot_base_url = ""
-        while True:
-            async with session.get(
-                f"{BASE_URL}/ilink/bot/get_qrcode_status?qrcode={qrcode}"
-            ) as res:
-                status = await res.json(content_type=None)
-
-            if status.get("status") == "confirmed":
-                bot_token = status["bot_token"]
-                bot_base_url = status.get("baseurl", "")
-                print(f"登录成功！baseurl={bot_base_url}")
+        saved_token, saved_baseurl = _load_saved_token()
+        if saved_token:
+            print(f"[token] 发现保存的 token，验证中...")
+            if await _verify_token(session, saved_token, saved_baseurl):
+                print(f"[token] 验证成功，跳过扫码（baseurl={saved_baseurl or BASE_URL}）")
+                bot_token = saved_token
+                bot_base_url = saved_baseurl
                 print(f"{'='*40}\n{COMMANDS_MSG}\n{'='*40}")
-                break
-            await asyncio.sleep(1)
+            else:
+                print(f"[token] 验证失败，走扫码流程")
+
+        if not bot_token:
+            # 1. 获取二维码
+            async with session.get(
+                f"{BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3"
+            ) as res:
+                data = await res.json(content_type=None)
+
+            qrcode = data["qrcode"]
+            qrcode_img_content = data.get("qrcode_img_content", "")
+
+            print("qrcode:", qrcode)
+            print("qrcode_img_content 前100字符:", str(qrcode_img_content)[:100])
+
+            if qrcode_img_content:
+                content = str(qrcode_img_content)
+                if content.startswith("data:image/"):
+                    header, b64 = content.split(",", 1)
+                    m = re.search(r"data:image/(\w+)", header)
+                    ext = m.group(1) if m else "png"
+                    with open(f"qrcode.{ext}", "wb") as f:
+                        f.write(base64.b64decode(b64))
+                    print(f"二维码已保存到 qrcode.{ext}")
+                elif content.startswith("http"):
+                    print("二维码图片地址:", content)
+                    print("请将图片地址复制后在微信里发给文件传输助手，然后在手机端微信打开链接即可连接！！")
+                elif content.startswith("<svg"):
+                    with open("qrcode.svg", "w", encoding="utf-8") as f:
+                        f.write(content)
+                    print("二维码已保存到 qrcode.svg，用浏览器打开")
+                else:
+                    with open("qrcode.png", "wb") as f:
+                        f.write(base64.b64decode(content))
+                    print("二维码已保存到 qrcode.png")
+
+            # 2. 等待扫码
+            print("等待扫码...")
+            while True:
+                async with session.get(
+                    f"{BASE_URL}/ilink/bot/get_qrcode_status?qrcode={qrcode}"
+                ) as res:
+                    status = await res.json(content_type=None)
+
+                if status.get("status") == "confirmed":
+                    bot_token = status["bot_token"]
+                    bot_base_url = status.get("baseurl", "")
+                    print(f"登录成功！baseurl={bot_base_url}")
+                    print(f"{'='*40}\n{COMMANDS_MSG}\n{'='*40}")
+                    _save_token(bot_token, bot_base_url)
+                    break
+                await asyncio.sleep(1)
 
         # 3. 共享状态（可变引用，传给定时器任务和消息循环）
         bot_token_ref = [bot_token]
@@ -397,7 +466,12 @@ async def main():
                 text = msg.get("item_list", [{}])[0].get("text_item", {}).get("text", "")
                 from_id = msg["from_user_id"]
                 context_token = msg["context_token"]
-                print(f"收到消息: {text}")
+                print(f"收到消息: {text} (from={from_id})")
+
+                # 白名单过滤：非空且不在列表，静默丢弃
+                if ALLOW_FROM and from_id not in ALLOW_FROM:
+                    print(f"[白名单] 拒绝非授权用户 {from_id}")
+                    continue
 
                 # 更新最近联系人（定时器任务用于发通知）
                 last_contact["from_id"] = from_id
@@ -544,6 +618,11 @@ ai = DusAPI(DusConfig(
     api_key=_raw_cfg["api_key"],
     base_url=_raw_cfg["base_url"],
     model1=_raw_cfg["model"],
-    prompt=_raw_cfg["prompt"],
+    prompt=_raw_cfg.get("prompt", ""),
+    session_id=_raw_cfg.get("session_id", "wechat-chen-dream"),
+    auth_password=_raw_cfg.get("auth_password", ""),
+    model_preferences=[(p[0], p[1]) for p in _raw_cfg.get("model_preferences", [])],
 ))
+# 白名单：config.allow_from 为空列表 = 允许所有人（bootstrap）
+ALLOW_FROM = set(_raw_cfg.get("allow_from", []) or [])
 asyncio.run(main())
