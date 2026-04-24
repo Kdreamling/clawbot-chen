@@ -352,7 +352,17 @@ async def _verify_token(session, token: str, baseurl: str) -> bool:
         ) as res:
             if res.status == 401:
                 return False
-            return True  # 200 或其他非 401 都算有效
+            # 微信 ilink 返回 HTTP 200 但 errcode 非 0 也算失效（-14 session timeout 等）
+            try:
+                body = await res.json(content_type=None)
+                if isinstance(body, dict):
+                    ec = body.get("errcode")
+                    if ec is not None and ec != 0:
+                        print(f"[token] 验证失败: errcode={ec} errmsg={body.get('errmsg')}")
+                        return False
+            except Exception:
+                pass
+            return True  # 200 且 errcode=0/缺省 都算有效
     except asyncio.TimeoutError:
         # 长轮询超时 == 服务器在 hold 连接 == token 被接受
         return True
@@ -532,6 +542,16 @@ async def main():
                 bot_token_ref[0],
                 bot_base_url_ref[0] or None,
             )
+            # token 失效（session timeout 等）：清 token.json 退出，systemd 拉起后走扫码
+            if isinstance(result, dict):
+                ec = result.get("errcode")
+                if ec is not None and ec != 0:
+                    print(f"[main] getupdates 失效: errcode={ec} errmsg={result.get('errmsg')} — 清 token 退出，systemd 重启走扫码")
+                    try:
+                        os.remove(TOKEN_FILE)
+                    except Exception:
+                        pass
+                    sys.exit(1)
             get_updates_buf = result.get("get_updates_buf") or get_updates_buf
 
             for msg in result.get("msgs") or []:
